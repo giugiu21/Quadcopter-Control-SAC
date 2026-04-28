@@ -283,15 +283,15 @@ class TrajectoryPlanner:
       Fase B) traiettoria continua (cerchio o lemniscata) eseguita all'infinito
               dopo l'ultimo waypoint (oppure hover se continuous=None).
     """
-    def __init__(self, mode='hover', A=None, B=None, waypoints=None,
+    def __init__(self, mode='hovering', A=None, B=None, waypoints=None,
                 T_seg=4.0, speed=0.3, psi_d=0.0,
                 continuous_kwargs=None):
         """
         Planner di traiettoria
 
         mode:
-        - 'hover'      : resta fermo nel punto A
-        - 'line'       : vai da A a B
+        - 'hovering'      : resta fermo nel punto A
+        - 'point-to-point'       : vai da A a B
         - 'waypoints'  : segue una lista di waypoint con min-jerk
         - 'circle'     : traiettoria circolare
         - 'lemniscate' : traiettoria a otto
@@ -317,12 +317,12 @@ class TrajectoryPlanner:
         self.A = np.array(A, dtype=float)
         self.B = None if B is None else np.array(B, dtype=float)
 
-        if self.mode == 'hover':
+        if self.mode == 'hovering':
             self.wps = [self.A.copy()]
             self.t_wp_end = 0.0
-        elif self.mode == 'line':
+        elif self.mode == 'point-to-point':
             if self.B is None:
-                raise ValueError("Per mode='line' devi specificare anche B.")
+                raise ValueError("Per mode='point-to-point' devi specificare anche B.")
 
             self.wps = [self.A.copy(), self.B.copy()]
             self.t_wp_end = 0.0
@@ -341,7 +341,7 @@ class TrajectoryPlanner:
         else:
             raise ValueError(
                 f"mode='{self.mode}' non riconosciuta. "
-                "Usa 'hover', 'line', 'waypoints', 'circle' o 'lemniscate'."
+                "Usa 'hovering', 'point-to-point', 'waypoints', 'circle' o 'lemniscate'."
             )
             
 
@@ -423,10 +423,10 @@ class TrajectoryPlanner:
 
     def __call__(self, t):
 
-        if self.mode == 'hover':
+        if self.mode == 'hovering':
             p, pd, pdd = self._hover(t)
 
-        elif self.mode == 'line':
+        elif self.mode == 'point-to-point':
             p, pd, pdd = self._line(t)
 
         elif self.mode == 'waypoints':
@@ -541,9 +541,13 @@ class CoppeliaInterface:
         return self.sim.getSimulationTime()
     
     def clear_reference_drawing(self):
-        self.sim.removeDrawingObject(self.reference_drawing)
-        self.reference_drawing = None
-        self.sim.step()
+        if self.reference_drawing is not None:
+            try:
+                self.sim.removeDrawingObject(self.reference_drawing)
+            except Exception as e:
+                print("Errore clear_reference_drawing:", e)
+            finally:
+                self.reference_drawing = None
 
 
     def draw_reference_point(self, planner, color=[1.0, 0.0, 0.0]):
@@ -599,66 +603,219 @@ class CoppeliaInterface:
 # ===========================================================================
 class Logger:
     def __init__(self):
-        self.t, self.p, self.p_d = [], [], []
-        self.e_p, self.e_R = [], []
-        self.f, self.m = [], []
-
-    def log(self, t, state, ref, out):
-        self.t.append(t)
-        self.p.append(state['p'].copy())
-        self.p_d.append(ref['p_d'].copy())
-        self.e_p.append(out['e_p'].copy())
-        self.e_R.append(out['e_R'].copy())
-        self.f.append(out['f'])
-        self.m.append(out['m'].copy())
-
-    def to_arrays(self):
-        return {
-            't':   np.array(self.t),
-            'p':   np.array(self.p),
-            'p_d': np.array(self.p_d),
-            'e_p': np.array(self.e_p),
-            'e_R': np.array(self.e_R),
-            'f':   np.array(self.f),
-            'm':   np.array(self.m),
+        self.data = {
+            "step": [],
+            "t": [],
+            "drone_pos": [],
+            "target_pos": [],
+            "pos_err": [],
+            "lin_vel": [],
+            "ang_vel": [],
+            "thrusts": [],
+            "force": [],
+            "moments": [],
+            "att_err": [],
         }
 
-    def plot(self, mode="hover"):
+    def log(self, step, t, state, ref, out, u_lambda=None):
+        self.data["step"].append(step)
+        self.data["t"].append(t)
+
+        drone_pos = state["p"].copy()
+        target_pos = ref["p_d"].copy()
+
+        # Per coerenza con il SAC:
+        # nel SAC pos_err = target_pos - drone_pos
+        pos_err = target_pos - drone_pos
+
+        self.data["drone_pos"].append(drone_pos)
+        self.data["target_pos"].append(target_pos)
+        self.data["pos_err"].append(pos_err)
+
+        self.data["lin_vel"].append(state["p_dot"].copy())
+        self.data["ang_vel"].append(state["omega"].copy())
+
+        if u_lambda is None:
+            self.data["thrusts"].append(np.zeros(4))
+        else:
+            self.data["thrusts"].append(np.asarray(u_lambda, dtype=float).copy())
+
+        self.data["force"].append(out["f"])
+        self.data["moments"].append(out["m"].copy())
+        self.data["att_err"].append(out["e_R"].copy())
+
+    
+    def to_dict(self):
+        return {
+            key: np.array(value)
+            for key, value in self.data.items()
+        }
+    
+    def plot(self, task="hovering", use_time_axis=False):
+        #time axis che fa?
         try:
             import matplotlib.pyplot as plt
         except ImportError:
             print("matplotlib non installato: salto i plot.")
             return
-        d = self.to_arrays()
-        labels = ['x', 'y', 'z']
-
-        fig, ax = plt.subplots(3, 2, figsize=(12, 8))
-        if mode=="hover":
-            fig.suptitle("Test HOVER", fontsize=18)
-        else:
-            fig.suptitle("Test POINT-TO-POINT", fontsize=18)
         
-        for i in range(3):
-            ax[i, 0].plot(d['t'], d['p'][:, i],   label=f'p_{labels[i]}')
-            ax[i, 0].plot(d['t'], d['p_d'][:, i], '--',
-                          label=f'p_d_{labels[i]}')
-            ax[i, 0].set_ylabel(f'pos {labels[i]} [m]')
-            ax[i, 0].grid(True); ax[i, 0].legend()
-            ax[i, 1].plot(d['t'], d['e_R'][:, i], label=f'e_R_{labels[i]}')
-            ax[i, 1].set_ylabel('e_R')
-            ax[i, 1].grid(True); ax[i, 1].legend()
-        ax[-1, 0].set_xlabel('t [s]'); ax[-1, 1].set_xlabel('t [s]')
-        #fig.suptitle('Tracking di posizione (sx) e errore di assetto (dx)')
-        fig.tight_layout()
+        ep_data = self.to_dict()
 
-        fig2, ax2 = plt.subplots(2, 1, figsize=(10, 5))
-        ax2[0].plot(d['t'], d['f']);  ax2[0].set_ylabel('f [N]'); ax2[0].grid(True)
-        ax2[1].plot(d['t'], d['m']);  ax2[1].set_ylabel('m [Nm]')
-        ax2[1].set_xlabel('t [s]');   ax2[1].grid(True)
-        ax2[1].legend(['m_x', 'm_y', 'm_z'])
-        fig2.suptitle('Comandi (f, m)')
-        fig2.tight_layout()
+        if use_time_axis:
+            x_axis = np.array(ep_data["t"])
+            x_label = "Tempo [s]"
+        else:
+            x_axis = np.arange(len(ep_data["step"]))
+            x_label = "Step"
+
+        drone_pos = np.array(ep_data["drone_pos"])
+        target_pos = np.array(ep_data["target_pos"])
+        pos_err = np.array(ep_data["pos_err"])
+        lin_vel = np.array(ep_data["lin_vel"])
+        thrusts = np.array(ep_data["thrusts"])
+
+        force = np.array(ep_data["force"])
+        moments = np.array(ep_data["moments"])
+        att_err = np.array(ep_data["att_err"])
+
+        pos_err_norm = np.linalg.norm(pos_err, axis=1)
+
+        if task == "point-to-point":
+            fig, axs = plt.subplots(3, 2, figsize=(10, 12))
+            fig.suptitle("Test POINT-TO-POINT - PD", fontsize=18)
+        else:
+            fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+            fig.suptitle("Test HOVERING - PD", fontsize=18)
+
+
+        # Posizione drone
+        axs[0, 0].plot(x_axis, drone_pos[:, 0], label="x")
+        axs[0, 0].plot(x_axis, drone_pos[:, 1], label="y")
+        axs[0, 0].plot(x_axis, drone_pos[:, 2], label="z")
+
+        axs[0, 0].plot(x_axis, target_pos[:, 0], "--", label="x_ref")
+        axs[0, 0].plot(x_axis, target_pos[:, 1], "--", label="y_ref")
+        axs[0, 0].plot(x_axis, target_pos[:, 2], "--", label="z_ref")
+
+        axs[0, 0].set_title("Posizione del drone")
+        axs[0, 0].set_xlabel(x_label)
+        axs[0, 0].set_ylabel("Posizione [m]")
+        axs[0, 0].legend()
+        axs[0, 0].grid(True)
+
+
+        # Errore di posizione
+        axs[0, 1].plot(x_axis, pos_err[:, 0], label="err_x")
+        axs[0, 1].plot(x_axis, pos_err[:, 1], label="err_y")
+        axs[0, 1].plot(x_axis, pos_err[:, 2], label="err_z")
+        axs[0, 1].set_title("Errore di posizione")
+        axs[0, 1].set_xlabel(x_label)
+        axs[0, 1].set_ylabel("Errore [m]")
+        axs[0, 1].legend()
+        axs[0, 1].grid(True)
+
+
+        # Norma errore posizione
+        axs[1, 0].plot(x_axis, pos_err_norm)
+        axs[1, 0].set_title("Norma errore di posizione")
+        axs[1, 0].set_xlabel(x_label)
+        axs[1, 0].set_ylabel("||pos_err|| [m]")
+        axs[1, 0].grid(True)
+
+
+        # Velocità lineare
+        axs[1, 1].plot(x_axis, lin_vel[:, 0], label="vx")
+        axs[1, 1].plot(x_axis, lin_vel[:, 1], label="vy")
+        axs[1, 1].plot(x_axis, lin_vel[:, 2], label="vz")
+        axs[1, 1].set_title("Velocità lineare")
+        axs[1, 1].set_xlabel(x_label)
+        axs[1, 1].set_ylabel("Velocità [m/s]")
+        axs[1, 1].legend()
+        axs[1, 1].grid(True)
+
+
+        # Traiettoria XY per point-to-point
+        if task == "point-to-point":
+                pointA = target_pos[0]
+                pointB = target_pos[-1]
+
+                axs[2, 0].plot(
+                    drone_pos[:, 0],
+                    drone_pos[:, 1],
+                    label="Traiettoria drone"
+                )
+
+                axs[2, 0].scatter(
+                    pointA[0],
+                    pointA[1],
+                    marker="x",
+                    s=100,
+                    label="Point A"
+                )
+
+                axs[2, 0].scatter(
+                    pointB[0],
+                    pointB[1],
+                    marker="x",
+                    s=100,
+                    label="Point B"
+                )
+
+                axs[2, 0].set_title("Traiettoria nel piano XY")
+                axs[2, 0].set_xlabel("x [m]")
+                axs[2, 0].set_ylabel("y [m]")
+                axs[2, 0].legend()
+                axs[2, 0].grid(True)
+                axs[2, 0].axis("equal")
+
+                axs[2, 1].plot(x_axis, att_err[:, 0], label="e_R_x")
+                axs[2, 1].plot(x_axis, att_err[:, 1], label="e_R_y")
+                axs[2, 1].plot(x_axis, att_err[:, 2], label="e_R_z")
+                axs[2, 1].set_title("Errore di assetto")
+                axs[2, 1].set_xlabel(x_label)
+                axs[2, 1].set_ylabel("e_R")
+                axs[2, 1].legend()
+                axs[2, 1].grid(True)
+
+                plt.tight_layout()
+                plt.show()
+
+   
+        # Input motori / lambda_i
+        plt.figure(figsize=(7, 5))
+        plt.plot(x_axis, thrusts[:, 0], label="motor_1")
+        plt.plot(x_axis, thrusts[:, 1], label="motor_2")
+        plt.plot(x_axis, thrusts[:, 2], label="motor_3")
+        plt.plot(x_axis, thrusts[:, 3], label="motor_4")
+        plt.title("Thrust dei motori")
+        plt.xlabel(x_label)
+        plt.ylabel("Thrust")
+        plt.legend()
+        plt.grid(True)
         plt.show()
+
+        # Forza totale e momenti, utili solo per PD
+        fig2, ax2 = plt.subplots(2, 1, figsize=(10, 6))
+
+        ax2[0].plot(x_axis, force)
+        ax2[0].set_title("Forza totale comandata")
+        ax2[0].set_xlabel(x_label)
+        ax2[0].set_ylabel("f [N]")
+        ax2[0].grid(True)
+
+        ax2[1].plot(x_axis, moments[:, 0], label="m_x")
+        ax2[1].plot(x_axis, moments[:, 1], label="m_y")
+        ax2[1].plot(x_axis, moments[:, 2], label="m_z")
+        ax2[1].set_title("Momenti comandati")
+        ax2[1].set_xlabel(x_label)
+        ax2[1].set_ylabel("m [Nm]")
+        ax2[1].legend()
+        ax2[1].grid(True)
+
+        plt.tight_layout()
+        plt.show()
+
+    
 
 
 # ===========================================================================
@@ -668,7 +825,6 @@ def main():
     params = QuadrotorParams()
     ctrl   = QuadrotorController(params)
     sim    = CoppeliaInterface(quad_name='/Quadcopter')
-    logger = Logger()
 
     # planner = TrajectoryPlanner(
     #     waypoints=[[3.0, 0.0, 0.05],
@@ -685,10 +841,11 @@ def main():
     t_total = 10.0
 
     for i in range(2):
+        logger = Logger()
         if(i==0): #faccio hovering
             planner = TrajectoryPlanner(
                 T_seg=4.0,
-                mode='hover',
+                mode='hovering',
                 A=[0.0, 0.0, 1.5],
                 speed=0.3,
                 psi_d=0.0
@@ -698,6 +855,7 @@ def main():
             sim.draw_reference_point(planner, color=[1.0, 0.0, 0.0])
             sim.sim.setObjectPosition(sim.quad, -1, [0.0, 0.0, 1.5])
             t = 0.0
+            step = 0
             try:
                 while t < t_total:
                     state = sim.get_state()
@@ -706,19 +864,27 @@ def main():
                     sim.apply_wrench(out['f'], out['m'], state['R'])
                     u_lambda = ctrl.alloc.F_tilde_inv @ np.hstack(([out['f']], out['m']))
                     sim.spin_propellers(np.clip(u_lambda, 0.0, None))
-                    logger.log(t, state, ref, out)
+                    logger.log(
+                        step=step,
+                        t=t,
+                        state=state,
+                        ref=ref,
+                        out=out,
+                        u_lambda=u_lambda
+                    )
                     sim.step()
                     t += dt
+                    step += 1
             finally:
                 sim.clear_reference_drawing()
                 sim.stop()
-                logger.plot(mode="hover")
+                logger.plot(task="hovering")
 
         else: #faccio A->B
             planner = TrajectoryPlanner(
-                # Per 'line' non servono waypoint: A e B sono gia' la traiettoria.
+                # Per 'point-to-point' non servono waypoint: A e B sono gia' la traiettoria.
                 T_seg=4.0,
-                mode='line',
+                mode='point-to-point',
                 A=[0.0, 0.0, 1.5],
                 B=[1.0, 0.0, 1.5],
                 speed=0.3,
@@ -728,6 +894,7 @@ def main():
             sim.sim.setObjectPosition(sim.quad, -1, [0.0, 0.0, 1.5])
             sim.draw_reference_trajectory(planner, t_total, dt, color=[1.0, 0.0, 0.0])
             t = 0.0
+            step = 0
             try:
                 while t < t_total:
                     state = sim.get_state()
@@ -736,13 +903,21 @@ def main():
                     sim.apply_wrench(out['f'], out['m'], state['R'])
                     u_lambda = ctrl.alloc.F_tilde_inv @ np.hstack(([out['f']], out['m']))
                     sim.spin_propellers(np.clip(u_lambda, 0.0, None))
-                    logger.log(t, state, ref, out)
+                    logger.log(
+                        step=step,
+                        t=t,
+                        state=state,
+                        ref=ref,
+                        out=out,
+                        u_lambda=u_lambda
+                    )
                     sim.step()
                     t += dt
+                    step += 1
             finally:
                 sim.clear_reference_drawing()
                 sim.stop()
-                logger.plot(mode="line")
+                logger.plot(task="point-to-point")
 
 
 if __name__ == '__main__':
